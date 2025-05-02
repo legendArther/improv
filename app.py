@@ -1,6 +1,10 @@
 import os
 import requests
 import json
+import imaplib # Added
+import email   # Added
+import re      # Added
+from bs4 import BeautifulSoup # Added
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -10,23 +14,37 @@ app = Flask(__name__)
 # Set these in your Render service environment settings
 IMPROVMX_API_KEY = os.getenv('IMPROVMX_API_KEY')
 APP_SECRET_KEY = os.getenv('APP_SECRET_KEY') # Secret to protect your own API endpoints
+ZOHO_IMAP_USER = os.getenv('ZOHO_IMAP_USER') # e.g., 'varunn@writebear.tech'
+ZOHO_IMAP_PASSWORD = os.getenv('ZOHO_IMAP_PASSWORD') # Your Zoho App Password or Account Password
 
 # --- Hardcoded Values ---
 # Domain and forward email are fixed in this version
 DOMAIN_NAME = "writebear.tech"
-FORWARD_EMAIL = "7harshdeep@gmail.com"
+FORWARD_EMAIL = "markdavis939@zohomail.com"
 BASE_URL = "https://api.improvmx.com/v3"
+ZOHO_IMAP_SERVER = "imap.zoho.com" # Added
+ZOHO_IMAP_PORT = 993              # Added (IMAP SSL port)
+OTP_TARGET_EMAIL = "varunn@writebear.tech" # Added - specify which email account to read
 
 # --- Helper Function to Check Server Configuration ---
 def check_config():
     """Checks if required environment variables are set."""
+    errors = []
     if not IMPROVMX_API_KEY:
-        print("CRITICAL SERVER ERROR: IMPROVMX_API_KEY environment variable not set.")
-        # Return tuple: (config_ok, error_response_object, status_code)
-        return False, jsonify({"success": False, "error": "Server configuration error: ImprovMX API Key missing."}), 500
+        errors.append("IMPROVMX_API_KEY environment variable not set.")
     if not APP_SECRET_KEY:
-        print("CRITICAL SERVER ERROR: APP_SECRET_KEY environment variable not set.")
-        return False, jsonify({"success": False, "error": "Server configuration error: App Secret Key missing."}), 500
+        errors.append("APP_SECRET_KEY environment variable not set.")
+    if not ZOHO_IMAP_USER:
+        errors.append("ZOHO_IMAP_USER environment variable not set.")
+    if not ZOHO_IMAP_PASSWORD:
+        errors.append("ZOHO_IMAP_PASSWORD environment variable not set.")
+
+    if errors:
+        full_error_message = "Server configuration error: " + "; ".join(errors)
+        print(f"CRITICAL SERVER ERROR: {full_error_message}")
+        # Return tuple: (config_ok, error_response_object, status_code)
+        return False, jsonify({"success": False, "error": full_error_message}), 500
+
     # Config is OK
     return True, None, None
 
@@ -34,7 +52,7 @@ def check_config():
 @app.route('/')
 def home():
     """Simple welcome message for the root URL."""
-    return jsonify({"message": "ImprovMX Alias Adder Service Ready."}), 200
+    return jsonify({"message": "ImprovMX Alias Adder & OTP Service Ready."}), 200
 
 # --- Secure POST Route (Recommended) ---
 @app.route('/add_alias', methods=['POST'])
@@ -160,8 +178,43 @@ def add_alias_get_route():
         print(f"ERROR (/add_alias_via_url GET): Failed to format HTML response. Error: {e}")
         return f"<h1>Internal Server Error</h1><p>Failed to format response.</p>", 500
 
+# --- NEW: Secure GET Route for OTP ---
+@app.route('/get_otp', methods=['GET'])
+def get_otp_route():
+    """
+    Reads the latest email for OTP_TARGET_EMAIL and extracts a 6-digit OTP.
+    Requires 'X-App-Secret' header for authentication.
+    Returns JSON response: {"success": true, "otp": "123456"} or error.
+    """
+    config_ok, error_response, status_code = check_config()
+    if not config_ok:
+        return error_response, status_code
 
-# --- Core Logic Function (Called by both routes) ---
+    # --- Authenticate Request to this Flask App (via Header) ---
+    provided_secret = request.headers.get('X-App-Secret')
+    if not provided_secret or provided_secret != APP_SECRET_KEY:
+        print(f"WARN (/get_otp GET): Unauthorized attempt. Secret in header: '{provided_secret}'")
+        return jsonify({"success": False, "error": "Unauthorized: Missing or invalid X-App-Secret header."}), 401
+
+    # --- Call the Core OTP Logic ---
+    otp, error_message = _get_latest_otp_from_email()
+
+    if otp:
+        print(f"INFO (/get_otp GET): Successfully retrieved OTP: {otp}")
+        return jsonify({"success": True, "otp": otp}), 200
+    else:
+        print(f"ERROR (/get_otp GET): Failed to retrieve OTP. Reason: {error_message}")
+        # Determine appropriate status code
+        if "Could not find OTP" in error_message:
+             status_code = 404 # Not Found
+        elif "Inbox empty" in error_message:
+             status_code = 404 # Not Found
+        else:
+            status_code = 500 # Internal Server Error / Service Unavailable
+        return jsonify({"success": False, "error": error_message}), status_code
+
+
+# --- Core Logic Function (ImprovMX Alias Addition) ---
 def _add_alias_logic(alias_name):
     """
     Handles the actual ImprovMX API call to create an alias.
@@ -173,74 +226,227 @@ def _add_alias_logic(alias_name):
         tuple: (Flask Response Object (jsonify result), HTTP Status Code)
     """
     # Prepare ImprovMX API Call details
-    # Correct endpoint for CREATING aliases requires POST
     api_endpoint = f"{BASE_URL}/domains/{DOMAIN_NAME}/aliases"
     auth = ('api', IMPROVMX_API_KEY) # Basic Auth
-    # Payload must include both 'alias' and 'forward' for creation
     payload = {
         "alias": alias_name,
-        "forward": FORWARD_EMAIL # Using the hardcoded forward email
+        "forward": FORWARD_EMAIL
     }
     headers = {'Content-Type': 'application/json'}
 
     print(f"Attempting ImprovMX API call to ADD alias: {alias_name}@{DOMAIN_NAME} -> {FORWARD_EMAIL}")
     try:
-        # Make the POST request to ImprovMX to create the alias
         response = requests.post(api_endpoint, auth=auth, headers=headers, json=payload, timeout=15)
-
-        # --- Process ImprovMX Response ---
         status_code = response.status_code
         try:
-            # Try to parse the response as JSON
             response_json = response.json()
             print(f"ImprovMX Response Status: {status_code}, Body: {response_json}")
 
-            # Check ImprovMX's specific success flag along with HTTP status
             if status_code == 200 and response_json.get("success"):
-                # Successful creation
                 return jsonify({
                     "success": True,
                     "message": "Alias added successfully via ImprovMX.",
                     "improvmx_response": response_json
                 }), 200
             else:
-                # Handle cases where ImprovMX returns 200 OK but "success": false,
-                # or when ImprovMX returns a non-200 status code (e.g., 400 for duplicate alias).
-                # Extract specific error message if available
                 error_message = response_json.get("errors", f"ImprovMX returned status {status_code} with success=false or error.")
                 print(f"ERROR: ImprovMX API call indicated failure. Status: {status_code}, Response: {response_json}")
                 return jsonify({
                     "success": False,
                     "message": f"Failed to add alias via ImprovMX.",
                     "improvmx_response": response_json,
-                    "improvmx_error": error_message # Provide specific ImprovMX error if possible
-                }), status_code if status_code >= 400 else 400 # Return ImprovMX's error code or default to 400
+                    "improvmx_error": error_message
+                }), status_code if status_code >= 400 else 400
 
         except json.JSONDecodeError:
-            # Handle cases where ImprovMX response is not valid JSON
             print(f"ERROR: ImprovMX returned non-JSON response. Status: {status_code}, Body: {response.text}")
             return jsonify({
                 "success": False,
                 "message": f"ImprovMX API request failed with status {status_code}. Could not decode JSON response.",
                 "improvmx_raw_response": response.text
-                }), status_code if status_code >= 400 else 502 # Use ImprovMX code or 502 Bad Gateway
+                }), status_code if status_code >= 400 else 502
 
     except requests.exceptions.Timeout:
         print(f"ERROR: Request to ImprovMX timed out.")
-        return jsonify({"success": False, "error": "Request to ImprovMX API timed out."}), 504 # Gateway Timeout
+        return jsonify({"success": False, "error": "Request to ImprovMX API timed out."}), 504
     except requests.exceptions.RequestException as e:
         print(f"ERROR: Network error communicating with ImprovMX: {e}")
-        return jsonify({"success": False, "error": f"Network error communicating with ImprovMX API: {e}"}), 503 # Service Unavailable
+        return jsonify({"success": False, "error": f"Network error communicating with ImprovMX API: {e}"}), 503
+
+
+# --- NEW: Core Logic Function (Read OTP from Email) ---
+def _get_latest_otp_from_email():
+    """
+    Connects to Zoho IMAP, fetches the latest email for ZOHO_IMAP_USER,
+    and extracts a 6-digit OTP.
+
+    Returns:
+        tuple: (otp_string, error_message_string)
+               Returns (None, error_message) on failure.
+               Returns (otp, None) on success.
+    """
+    mail = None # Initialize mail object outside try block for finally
+    try:
+        print(f"Attempting IMAP connection to {ZOHO_IMAP_SERVER}:{ZOHO_IMAP_PORT} for user {ZOHO_IMAP_USER}")
+        mail = imaplib.IMAP4_SSL(ZOHO_IMAP_SERVER, ZOHO_IMAP_PORT)
+        
+        # Use ZOHO_IMAP_USER and ZOHO_IMAP_PASSWORD from environment variables
+        typ, account_details = mail.login(ZOHO_IMAP_USER, ZOHO_IMAP_PASSWORD)
+        if typ != 'OK':
+            print(f"ERROR: IMAP login failed for {ZOHO_IMAP_USER}. Response: {account_details}")
+            return None, f"IMAP login failed for {ZOHO_IMAP_USER}"
+        print("IMAP login successful.")
+
+        typ, data = mail.select("inbox")
+        if typ != 'OK':
+             print(f"ERROR: Failed to select inbox. Response: {data}")
+             return None, "Failed to select inbox."
+        print("Inbox selected.")
+
+        # Search for all emails and get IDs
+        # Consider searching for specific subjects/senders if needed: '(SUBJECT "Stake.com Verification")'
+        result, data = mail.search(None, "ALL")
+        if result != 'OK':
+            print(f"ERROR: Failed to search inbox. Response: {data}")
+            return None, "Failed to search inbox."
+
+        ids = data[0].split()
+        if not ids:
+            print("INFO: Inbox is empty.")
+            return None, "Inbox empty, no email found."
+
+        latest_id = ids[-1]
+        print(f"Fetching latest email with ID: {latest_id.decode()}")
+
+        # Fetch the email content
+        result, msg_data = mail.fetch(latest_id, "(RFC822)")
+        if result != 'OK':
+            print(f"ERROR: Failed to fetch email ID {latest_id.decode()}. Response: {msg_data}")
+            return None, f"Failed to fetch email ID {latest_id.decode()}"
+
+        msg = email.message_from_bytes(msg_data[0][1])
+
+        print("Email Subject:", msg["subject"])
+        print("Email From:", msg["from"])
+        # print("Email To:", msg["to"]) # Usually varunn@writebear.tech
+
+        body_text = None
+
+        if msg.is_multipart():
+            print("Parsing multipart email...")
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition"))
+
+                # Skip attachments
+                if "attachment" in content_disposition:
+                    continue
+
+                try:
+                    payload = part.get_payload(decode=True)
+                    if not payload: # Skip empty parts
+                         continue
+                    # Decode payload using charset if specified, otherwise try common ones
+                    charset = part.get_content_charset() or 'utf-8' # Default to utf-8
+                    part_text = payload.decode(charset, errors='replace') # Use replace for robustness
+
+                    if content_type == "text/plain":
+                        print("Found text/plain part.")
+                        body_text = part_text # Prefer plain text
+                        break # Found plain text, stop searching parts
+                    elif content_type == "text/html":
+                        print("Found text/html part (will parse if no plain text found).")
+                        soup = BeautifulSoup(part_text, "html.parser")
+                        body_text = soup.get_text() # Extract text from HTML
+
+                except Exception as e:
+                    print(f"WARN: Could not decode/process part {content_type}. Error: {e}")
+                    continue # Try next part
+
+        else: # Not multipart
+            print("Parsing non-multipart email...")
+            content_type = msg.get_content_type()
+            try:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    charset = msg.get_content_charset() or 'utf-8'
+                    msg_text = payload.decode(charset, errors='replace')
+
+                    if content_type == "text/plain":
+                        print("Found text/plain content.")
+                        body_text = msg_text
+                    elif content_type == "text/html":
+                        print("Found text/html content.")
+                        soup = BeautifulSoup(msg_text, "html.parser")
+                        body_text = soup.get_text()
+                    else:
+                        print(f"WARN: Non-multipart email has unsupported content type: {content_type}")
+
+            except Exception as e:
+                 print(f"WARN: Could not decode/process non-multipart body. Error: {e}")
+
+
+        if not body_text:
+            print("ERROR: No readable email body found after parsing.")
+            return None, "No readable email body found."
+
+        # print("\n--- Extracted Body Text ---")
+        # print(body_text[:500] + "..." if len(body_text) > 500 else body_text) # Print snippet for debugging
+        # print("--- End Body Text ---")
+
+        # --- Extract 6-digit OTP using regex ---
+        # \b ensures we match whole numbers (word boundary)
+        # \d{6} matches exactly 6 digits
+        otp_match = re.search(r'\b(\d{6})\b', body_text)
+
+        if otp_match:
+            otp = otp_match.group(1)
+            print(f"SUCCESS: Found 6-digit OTP: {otp}")
+            return otp, None
+        else:
+            print("ERROR: Could not find 6-digit OTP in the email body.")
+            # Log more of the body text if OTP isn't found, for debugging
+            print("--- Body Text Searched (Full) ---")
+            print(body_text)
+            print("--- End Body Text Searched ---")
+            return None, "Could not find 6-digit OTP in the email body."
+
+    except imaplib.IMAP4.error as e:
+        print(f"ERROR: IMAP error occurred: {e}")
+        return None, f"IMAP error: {e}"
+    except ConnectionRefusedError as e:
+         print(f"ERROR: IMAP connection refused: {e}")
+         return None, f"IMAP connection refused ({ZOHO_IMAP_SERVER}:{ZOHO_IMAP_PORT})"
+    except Exception as e:
+        # Catch other potential errors (network, parsing, etc.)
+        import traceback
+        print(f"ERROR: An unexpected error occurred during email processing: {e}")
+        print(traceback.format_exc()) # Print stack trace for debugging
+        return None, f"An unexpected server error occurred: {e}"
+
+    finally:
+        # Ensure logout happens even if errors occurred
+        if mail and mail.state == 'SELECTED':
+            try:
+                mail.close()
+                print("IMAP inbox closed.")
+            except Exception as e:
+                 print(f"WARN: Error closing IMAP inbox: {e}")
+        if mail and mail.state != 'LOGOUT':
+             try:
+                 mail.logout()
+                 print("IMAP logout successful.")
+             except Exception as e:
+                 print(f"WARN: Error during IMAP logout: {e}")
 
 
 # --- Optional: Local run section (Gunicorn is used on Render) ---
 # Use this block to run the app locally for testing
 # Make sure to set the environment variables locally as well
-# (e.g., export IMPROVMX_API_KEY='...' ; export APP_SECRET_KEY='...')
+# (e.g., export IMPROVMX_API_KEY='...' ; export APP_SECRET_KEY='...' ; export ZOHO_IMAP_USER='...' ; export ZOHO_IMAP_PASSWORD='...')
 # if __name__ == '__main__':
 #     print("Attempting to run Flask app locally...")
 #     # Check for environment variables locally for easier debugging
-#     if not os.getenv('IMPROVMX_API_KEY'): print("WARNING: IMPROVMX_API_KEY env var not set locally.")
-#     if not os.getenv('APP_SECRET_KEY'): print("WARNING: APP_SECRET_KEY env var not set locally.")
+#     check_config() # Run check at startup
 #     # Run on port 5001, enable debug mode for development
 #     app.run(debug=True, port=5001, host='0.0.0.0')
