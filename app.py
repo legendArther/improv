@@ -183,6 +183,43 @@ def add_alias_get_route():
 def get_otp_route():
     """
     Reads the latest email for OTP_TARGET_EMAIL and extracts a 6-digit OTP.
+    !!! WARNING: This endpoint is currently PUBLIC and has NO AUTHENTICATION !!!
+    Returns JSON response: {"success": true, "otp": "123456"} or error.
+    Example URL: https://your-app-name.onrender.com/get_otp
+    """
+    config_ok, error_response, status_code = check_config()
+    if not config_ok:
+        # Still return JSON for API consistency, even for config errors
+        return error_response, status_code
+
+    # --- Authentication Removed ---
+    # The following lines that checked X-App-Secret header are removed:
+    # provided_secret = request.headers.get('X-App-Secret')
+    # if not provided_secret or provided_secret != APP_SECRET_KEY:
+    #     print(f"WARN (/get_otp GET): Unauthorized attempt. Secret in header: '{provided_secret}'")
+    #     return jsonify({"success": False, "error": "Unauthorized: Missing or invalid X-App-Secret header."}), 401
+    # --- End of Removed Authentication Block ---
+
+    print("INFO (/get_otp GET): Public endpoint accessed.") # Log access
+
+    # --- Call the Core OTP Logic ---
+    otp, error_message = _get_latest_otp_from_email()
+
+    if otp:
+        print(f"INFO (/get_otp GET): Successfully retrieved OTP: {otp}")
+        return jsonify({"success": True, "otp": otp}), 200
+    else:
+        print(f"ERROR (/get_otp GET): Failed to retrieve OTP. Reason: {error_message}")
+        # Determine appropriate status code
+        if "Could not find OTP" in error_message:
+             status_code = 404 # Not Found
+        elif "Inbox empty" in error_message:
+             status_code = 404 # Not Found
+        else:
+            status_code = 500 # Internal Server Error / Service Unavailable
+        return jsonify({"success": False, "error": error_message}), status_code
+    """
+    Reads the latest email for OTP_TARGET_EMAIL and extracts a 6-digit OTP.
     Requires 'X-App-Secret' header for authentication.
     Returns JSON response: {"success": true, "otp": "123456"} or error.
     """
@@ -438,15 +475,3 @@ def _get_latest_otp_from_email():
                  print("IMAP logout successful.")
              except Exception as e:
                  print(f"WARN: Error during IMAP logout: {e}")
-
-
-# --- Optional: Local run section (Gunicorn is used on Render) ---
-# Use this block to run the app locally for testing
-# Make sure to set the environment variables locally as well
-# (e.g., export IMPROVMX_API_KEY='...' ; export APP_SECRET_KEY='...' ; export ZOHO_IMAP_USER='...' ; export ZOHO_IMAP_PASSWORD='...')
-# if __name__ == '__main__':
-#     print("Attempting to run Flask app locally...")
-#     # Check for environment variables locally for easier debugging
-#     check_config() # Run check at startup
-#     # Run on port 5001, enable debug mode for development
-#     app.run(debug=True, port=5001, host='0.0.0.0')
