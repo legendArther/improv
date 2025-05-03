@@ -434,7 +434,7 @@ def _get_latest_otp_from_email():
         # --- Extract 6-digit OTP using regex ---
         # \b ensures we match whole numbers (word boundary)
         # \d{6} matches exactly 6 digits
-        otp_match = re.search(r'\b(\d{6})\b', body_text)
+        otp_match = re.search(r'(\d{6})', body_text)
 
         if otp_match:
             otp = otp_match.group(1)
