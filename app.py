@@ -314,6 +314,186 @@ def _add_alias_logic(alias_name):
 # --- NEW: Core Logic Function (Read OTP from Email) ---
 def _get_latest_otp_from_email():
     """
+    Connects to Zoho IMAP, fetches the latest up to TWO emails for ZOHO_IMAP_USER,
+    checks them newest first, and extracts the first 6-digit OTP found.
+
+    Returns:
+        tuple: (otp_string, error_message_string)
+               Returns (None, error_message) on failure.
+               Returns (otp, None) on success.
+    """
+    mail = None
+    try:
+        print(f"Attempting IMAP connection to {ZOHO_IMAP_SERVER}:{ZOHO_IMAP_PORT} for user {ZOHO_IMAP_USER}")
+        mail = imaplib.IMAP4_SSL(ZOHO_IMAP_SERVER, ZOHO_IMAP_PORT)
+        typ, account_details = mail.login(ZOHO_IMAP_USER, ZOHO_IMAP_PASSWORD)
+        if typ != 'OK':
+            print(f"ERROR: IMAP login failed for {ZOHO_IMAP_USER}. Response: {account_details}")
+            return None, f"IMAP login failed for {ZOHO_IMAP_USER}"
+        print("IMAP login successful.")
+
+        typ, data = mail.select("inbox")
+        if typ != 'OK':
+            print(f"ERROR: Failed to select inbox. Response: {data}")
+            # Ensure logout happens even on early failures
+            if mail and mail.state != 'LOGOUT': mail.logout()
+            return None, "Failed to select inbox."
+        print("Inbox selected.")
+
+        # Search for all emails and get IDs
+        # Consider adding UNSEEN or SUBJECT filter if needed later
+        result, data = mail.search(None, "ALL")
+        if result != 'OK':
+            print(f"ERROR: Failed to search inbox. Response: {data}")
+            if mail and mail.state != 'LOGOUT': mail.logout() # Logout on search failure
+            return None, "Failed to search inbox."
+
+        all_ids_bytes = data[0].split()
+        if not all_ids_bytes:
+            print("INFO: Inbox is empty.")
+            # Logout before returning
+            if mail and mail.state != 'LOGOUT': mail.logout()
+            return None, "Inbox empty, no email found."
+
+        # --- MODIFICATION START ---
+        # Get the last two IDs (or fewer if less than 2 emails exist)
+        # Slicing handles cases with 0 or 1 email gracefully
+        ids_to_check_bytes = all_ids_bytes[-2:]
+
+        # Process newest first
+        ids_to_check_bytes.reverse() # Now it's [latest, second_latest] or [latest]
+
+        print(f"INFO: Checking up to {len(ids_to_check_bytes)} latest email(s)... IDs: {[id_b.decode() for id_b in ids_to_check_bytes]}")
+
+        for email_id_bytes in ids_to_check_bytes:
+            email_id_str = email_id_bytes.decode() # For logging
+            print(f"\n--- Processing Email ID: {email_id_str} ---")
+
+            # Fetch the email content
+            result, msg_data = mail.fetch(email_id_bytes, "(RFC822)")
+            if result != 'OK':
+                print(f"ERROR: Failed to fetch email ID {email_id_str}. Response: {msg_data}. Skipping this email.")
+                continue # Try the next email ID in the list
+
+            msg = email.message_from_bytes(msg_data[0][1])
+
+            print(f"Email ID {email_id_str} Subject:", msg["subject"])
+            # print(f"Email ID {email_id_str} From:", msg["from"]) # Optional logging
+
+            body_text = None
+            # --- Email parsing logic (identical to before) ---
+            if msg.is_multipart():
+                # print("Parsing multipart email...") # Less verbose logging
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+                    if "attachment" in content_disposition: continue
+                    try:
+                        payload = part.get_payload(decode=True)
+                        if not payload: continue
+                        charset = part.get_content_charset() or 'utf-8'
+                        part_text = payload.decode(charset, errors='replace')
+
+                        if content_type == "text/plain":
+                            # print("Found text/plain part.")
+                            body_text = part_text
+                            # Prioritize plain text if available FOR THIS EMAIL
+                            break # Stop checking parts for *this* email
+                        elif content_type == "text/html":
+                            # print("Found text/html part.")
+                            soup = BeautifulSoup(part_text, "html.parser")
+                            # Only assign HTML if plain text wasn't already found
+                            if body_text is None:
+                                body_text = soup.get_text()
+
+                    except Exception as e:
+                        print(f"WARN: Could not decode/process part {content_type} for email {email_id_str}. Error: {e}")
+                        continue
+            else: # Not multipart
+                # print("Parsing non-multipart email...") # Less verbose logging
+                content_type = msg.get_content_type()
+                try:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        charset = msg.get_content_charset() or 'utf-8'
+                        msg_text = payload.decode(charset, errors='replace')
+                        if "text/" in content_type: # Broader check for text types
+                           # print(f"Found {content_type} content.")
+                           if content_type == "text/html":
+                               soup = BeautifulSoup(msg_text, "html.parser")
+                               body_text = soup.get_text()
+                           else: # Assume plain text or treat others as plain
+                               body_text = msg_text
+                        # else: # Ignore non-text types
+                        #    print(f"WARN: Non-multipart email has non-text content type: {content_type}")
+                except Exception as e:
+                    print(f"WARN: Could not decode/process non-multipart body for email {email_id_str}. Error: {e}")
+
+            # --- Check if body was extracted for this email ---
+            if not body_text:
+                print(f"INFO: No readable email body found for email ID {email_id_str}. Checking next (if any).")
+                continue # Try the next email ID
+
+            # --- DEBUG: Log the extracted body text ---
+            print(f"--- Body Text Extracted (Email ID: {email_id_str}) ---")
+            print(f"Type: {type(body_text)}, Length: {len(body_text)}")
+            print(repr(body_text[:1000]) + ('...' if len(body_text) > 1000 else '')) # Print repr snippet
+            print("--- End Body Text ---")
+
+            # --- Extract 6-digit OTP using regex (using the robust lookaround version) ---
+            # Use r'\b(\d{6})' if you preferred that one and it worked locally
+            otp_match = re.search(r'(?<!\d)(\d{6})(?!\d)', body_text) # Recommended
+
+            if otp_match:
+                otp = otp_match.group(1)
+                print(f"SUCCESS: Found 6-digit OTP: {otp} in email ID {email_id_str}")
+                # --- OTP Found - Logout and Return Success ---
+                if mail and mail.state != 'LOGOUT': mail.logout()
+                return otp, None # SUCCESS!
+            else:
+                print(f"INFO: Could not find 6-digit OTP in email ID {email_id_str}. Checking next (if any).")
+                # Loop continues to the next email_id automatically
+
+        # --- MODIFICATION END ---
+
+        # --- If loop finishes without finding OTP ---
+        print(f"ERROR: OTP not found after checking the last {len(ids_to_check_bytes)} email(s).")
+        if mail and mail.state != 'LOGOUT': mail.logout() # Logout before returning error
+        return None, f"Could not find 6-digit OTP in the last {len(ids_to_check_bytes)} email(s)."
+
+    except imaplib.IMAP4.error as e:
+        print(f"ERROR: IMAP error occurred: {e}")
+        # Attempt logout even after IMAP errors if connection object exists
+        if mail and mail.state != 'LOGOUT':
+             try: mail.logout()
+             except: pass # Ignore errors during logout after another error
+        return None, f"IMAP error: {e}"
+    except ConnectionRefusedError as e:
+         print(f"ERROR: IMAP connection refused: {e}")
+         # No connection, so no logout needed
+         return None, f"IMAP connection refused ({ZOHO_IMAP_SERVER}:{ZOHO_IMAP_PORT})"
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred during email processing: {e}")
+        print(traceback.format_exc()) # Print stack trace
+        # Attempt logout on general exceptions
+        if mail and mail.state != 'LOGOUT':
+             try: mail.logout()
+             except: pass
+        return None, f"An unexpected server error occurred: {e}"
+
+    finally:
+        # This finally block might be redundant now as logout is handled in return paths,
+        # but it acts as a final safety net if an exception occurs before a return
+        # or if a return path misses the logout.
+        if mail and mail.state != 'LOGOUT':
+            print("INFO: Ensuring IMAP logout in finally block.")
+            try:
+                if mail.state == 'SELECTED': mail.close()
+                mail.logout()
+                print("IMAP final logout successful.")
+            except Exception as e:
+                 print(f"WARN: Error during final IMAP logout/close: {e}")   
+                 """
     Connects to Zoho IMAP, fetches the latest email for ZOHO_IMAP_USER,
     and extracts a 6-digit OTP.
 
